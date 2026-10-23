@@ -81,6 +81,20 @@ uint64_t LC32GuestForwardInvocation(const uint32_t *words, uint32_t stret) {
         LC32ForwardingFailure(receiver, selector,
             "aggregate return requires an unsupported full-forwarding ABI");
     }
+    /* Legacy NSObject class versioning (+version / +setVersion:) is provided
+     * by Foundation on iOS but not by the guest shim. Answer it here as a
+     * last resort so a class that reaches forwarding for these selectors
+     * (Luxor Evolved Lite's iOS_AppDelegate) does not abort. The version is
+     * stored per class by libobjc, as on Apple's runtime. */
+    if(receiver && selector && object_isClass(receiver)) {
+        const char *name = sel_getName(selector);
+        if(name && strcmp(name, "version") == 0)
+            return (uint32_t)(int32_t)class_getVersion((Class)receiver);
+        if(name && strcmp(name, "setVersion:") == 0) {
+            class_setVersion((Class)receiver, (int)words[2]);
+            return 0;
+        }
+    }
     if(!receiver || !selector) {
         LC32ForwardingFailure(receiver, selector, "invalid receiver or selector");
     }
