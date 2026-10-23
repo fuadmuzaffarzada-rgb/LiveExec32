@@ -1649,6 +1649,13 @@ OSStatus AudioConverterDispose(AudioConverterRef inAudioConverter) {
         LC32_AUDIO_U32((uintptr_t)inAudioConverter));
 }
 
+OSStatus AudioConverterReset(AudioConverterRef inAudioConverter) {
+    if(!inAudioConverter) return kAudio_ParamError;
+    return (OSStatus)LC32_AUDIO_CALL(
+        LC32AudioToolboxOpAudioConverterReset,
+        LC32_AUDIO_U32((uintptr_t)inAudioConverter));
+}
+
 OSStatus AudioConverterFillComplexBuffer(
         AudioConverterRef inAudioConverter,
         AudioConverterComplexInputDataProc inInputDataProc,
