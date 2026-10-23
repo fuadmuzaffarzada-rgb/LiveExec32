@@ -1370,6 +1370,17 @@ OSStatus DispatchObservedAudioSessionProperty(
 
     switch(SlotU32(call, 0)) {
         case kAudioSessionProperty_OtherAudioIsPlaying: {
+            /* Legacy games ask this at startup and, when it is non-zero, skip
+             * their own music (Apple's guidance was "do not fight the user's
+             * music"). On a modern host the answer is true whenever any other
+             * app is making sound, including the host's own background audio,
+             * so these games stay silent. Report "no other audio" unless the
+             * LC32_REPORT_OTHER_AUDIO environment variable is set to 1. */
+            const char *report = getenv("LC32_REPORT_OTHER_AUDIO");
+            if(!(report && report[0] == '1')) {
+                const u32 value = 0;
+                return WriteAudioSessionValue(call, &value, sizeof(value));
+            }
             SEL selector = sel_registerName("isOtherAudioPlaying");
             if(![session respondsToSelector:selector]) break;
             const u32 value = reinterpret_cast<BOOL (*)(id, SEL)>(
