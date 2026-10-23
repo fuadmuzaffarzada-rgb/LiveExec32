@@ -50,9 +50,22 @@ static void LC32AudioLog(uint32_t opcode, uint32_t status,
     pthread_mutex_lock(&LC32AudioLogMutex);
     if(LC32AudioLogEvents < 200) {
         ++LC32AudioLogEvents;
-        fprintf(stderr, "LC32AudioLog #%u op=%u arg0=0x%x status=%d\n",
+        char line[120];
+        snprintf(line, sizeof(line),
+            "LC32AudioLog #%u op=%u arg0=0x%x status=%d\n",
             LC32AudioLogEvents, opcode,
             slotCount > 0 ? (unsigned)slots[0] : 0, (int)status);
+        fputs(line, stderr);
+        char exe[1024];
+        uint32_t exeSize = sizeof(exe);
+        if(_NSGetExecutablePath(exe, &exeSize) == 0) {
+            char *marker = strstr(exe, "/Documents/");
+            if(marker) {
+                strcpy(marker + strlen("/Documents/"), "lc32-audio-log.txt");
+                FILE *file = fopen(exe, "a");
+                if(file) { fputs(line, file); fclose(file); }
+            }
+        }
     }
     pthread_mutex_unlock(&LC32AudioLogMutex);
 }
