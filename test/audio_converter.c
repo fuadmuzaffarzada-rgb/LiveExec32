@@ -238,6 +238,43 @@ int main(void) {
         passed &= retainedDisposeStatus == noErr;
     }
 
+    /* Reset must succeed on a live converter, leave it usable, and reject
+     * a NULL converter. */
+    OSStatus (*resetConverter)(AudioConverterRef) = AudioConverterReset;
+    const OSStatus nullResetStatus = resetConverter(NULL);
+    const OSStatus resetStatus = resetConverter(converter);
+    SInt16 resetOutput[kInputFrameCount] = {0};
+    ConverterInputState resetState = {
+        .converter = converter,
+        .samples = input,
+        .sampleCount = kInputFrameCount,
+        .callbackValid = 1,
+    };
+    expectedInputState = &resetState;
+    UInt32 resetFrameCount = kInputFrameCount;
+    AudioBufferList resetData = {
+        .mNumberBuffers = 1,
+        .mBuffers = {{
+            .mNumberChannels = 1,
+            .mDataByteSize = sizeof(resetOutput),
+            .mData = resetOutput,
+        }},
+    };
+    const OSStatus resetFillStatus = AudioConverterFillComplexBuffer(
+        converter, converter_input_callback, &resetState,
+        &resetFrameCount, &resetData, NULL);
+    expectedInputState = NULL;
+    const int resetPassed = nullResetStatus != noErr &&
+        resetStatus == noErr && resetFillStatus == noErr &&
+        resetState.callbackValid &&
+        resetFrameCount == kInputFrameCount &&
+        memcmp(input, resetOutput, sizeof(resetOutput)) == 0;
+    passed &= resetPassed;
+    printf("audio-converter-reset: %s (null=%d reset=%d fill=%d frames=%u)\n",
+        resetPassed ? "PASS" : "FAIL", (int)nullResetStatus,
+        (int)resetStatus, (int)resetFillStatus,
+        (unsigned int)resetFrameCount);
+
     const OSStatus disposeStatus = AudioConverterDispose(converter);
     const int disposePassed = disposeStatus == noErr;
     passed &= disposePassed;
