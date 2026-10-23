@@ -30,14 +30,10 @@ static void LC32AudioToolboxResolveDispatcher(void) {
         LC32Dlsym("LC32_AudioToolbox_Dispatch", YES);
 }
 
-/* DIAGNOSTIC: records the audio setup calls the game makes and, on the first
- * failing one (or after 8 setup calls with no failure), stops the game on
- * purpose with a message that lists them. The crash report then shows
- * "[op:arg0:status]" entries, so no log file is needed. Remove after use. */
+/* Logging only (no abort): prints the audio setup calls the game makes to
+ * stderr as "LC32AudioLog #n op=.. arg0=0x.. status=..". Capped at 200 lines. */
 static pthread_mutex_t LC32AudioLogMutex = PTHREAD_MUTEX_INITIALIZER;
-static char LC32AudioLogBuffer[700];
 static unsigned LC32AudioLogEvents;
-static int LC32AudioLogReported;
 
 static void LC32AudioLog(uint32_t opcode, uint32_t status,
                          const uint64_t *slots, uint32_t slotCount) {
@@ -50,28 +46,13 @@ static void LC32AudioLog(uint32_t opcode, uint32_t status,
         opcode == LC32AudioToolboxOpAudioConverterNew ||
         opcode == LC32AudioToolboxOpExtAudioFileOpenURL ||
         opcode == LC32AudioToolboxOpAudioFileOpenURL;
-    if(!setup) return;
+    if(!setup && status == 0) return;
     pthread_mutex_lock(&LC32AudioLogMutex);
-    if(!LC32AudioLogReported) {
-        size_t used = strlen(LC32AudioLogBuffer);
-        if(used + 48 < sizeof(LC32AudioLogBuffer)) {
-            snprintf(LC32AudioLogBuffer + used,
-                sizeof(LC32AudioLogBuffer) - used, "[%u:%x:%d]", opcode,
-                slotCount > 0 ? (unsigned)slots[0] : 0, (int)status);
-        }
+    if(LC32AudioLogEvents < 200) {
         ++LC32AudioLogEvents;
-        if(status != 0 || LC32AudioLogEvents >= 8) {
-            LC32AudioLogReported = 1;
-            char message[900];
-            snprintf(message, sizeof(message),
-                "LC32 audio diag (op:arg0:status): %s", LC32AudioLogBuffer);
-            fprintf(stderr, "%s\n", message);
-            void (*abortWithReason)(uint32_t, uint64_t, const char *,
-                uint64_t) = (void (*)(uint32_t, uint64_t, const char *,
-                uint64_t))dlsym(RTLD_DEFAULT, "abort_with_reason");
-            if(abortWithReason) abortWithReason(8, 1, message, 0x80);
-            abort();
-        }
+        fprintf(stderr, "LC32AudioLog #%u op=%u arg0=0x%x status=%d\n",
+            LC32AudioLogEvents, opcode,
+            slotCount > 0 ? (unsigned)slots[0] : 0, (int)status);
     }
     pthread_mutex_unlock(&LC32AudioLogMutex);
 }
