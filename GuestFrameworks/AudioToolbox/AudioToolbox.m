@@ -15,9 +15,12 @@
 #define LC32_TRACE_AUDIO_OUTPUT 0
 #endif
 
-#if LC32_TRACE_AUDIO_OUTPUT
+#include <dlfcn.h>
 #include <stdio.h>
-#endif
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <mach-o/dyld.h>
 
 static pthread_once_t LC32AudioToolboxDispatcherOnce = PTHREAD_ONCE_INIT;
 static uint64_t LC32AudioToolboxDispatcherAddress;
@@ -25,6 +28,52 @@ static uint64_t LC32AudioToolboxDispatcherAddress;
 static void LC32AudioToolboxResolveDispatcher(void) {
     LC32AudioToolboxDispatcherAddress =
         LC32Dlsym("LC32_AudioToolbox_Dispatch", YES);
+}
+
+/* DIAGNOSTIC: records the audio setup calls the game makes and, on the first
+ * failing one (or after 8 setup calls with no failure), stops the game on
+ * purpose with a message that lists them. The crash report then shows
+ * "[op:arg0:status]" entries, so no log file is needed. Remove after use. */
+static pthread_mutex_t LC32AudioLogMutex = PTHREAD_MUTEX_INITIALIZER;
+static char LC32AudioLogBuffer[700];
+static unsigned LC32AudioLogEvents;
+static int LC32AudioLogReported;
+
+static void LC32AudioLog(uint32_t opcode, uint32_t status,
+                         const uint64_t *slots, uint32_t slotCount) {
+    const int setup = opcode == LC32AudioToolboxOpAudioSessionGetProperty ||
+        opcode == LC32AudioToolboxOpAudioSessionSetActive ||
+        opcode == LC32AudioToolboxOpAudioSessionSetProperty ||
+        opcode == LC32AudioToolboxOpAudioQueueNewOutput ||
+        opcode == LC32AudioToolboxOpAudioQueueStart ||
+        opcode == LC32AudioToolboxOpRemoteIOOutputStart ||
+        opcode == LC32AudioToolboxOpAudioConverterNew ||
+        opcode == LC32AudioToolboxOpExtAudioFileOpenURL ||
+        opcode == LC32AudioToolboxOpAudioFileOpenURL;
+    if(!setup) return;
+    pthread_mutex_lock(&LC32AudioLogMutex);
+    if(!LC32AudioLogReported) {
+        size_t used = strlen(LC32AudioLogBuffer);
+        if(used + 48 < sizeof(LC32AudioLogBuffer)) {
+            snprintf(LC32AudioLogBuffer + used,
+                sizeof(LC32AudioLogBuffer) - used, "[%u:%x:%d]", opcode,
+                slotCount > 0 ? (unsigned)slots[0] : 0, (int)status);
+        }
+        ++LC32AudioLogEvents;
+        if(status != 0 || LC32AudioLogEvents >= 8) {
+            LC32AudioLogReported = 1;
+            char message[900];
+            snprintf(message, sizeof(message),
+                "LC32 audio diag (op:arg0:status): %s", LC32AudioLogBuffer);
+            fprintf(stderr, "%s\n", message);
+            void (*abortWithReason)(uint32_t, uint64_t, const char *,
+                uint64_t) = (void (*)(uint32_t, uint64_t, const char *,
+                uint64_t))dlsym(RTLD_DEFAULT, "abort_with_reason");
+            if(abortWithReason) abortWithReason(8, 1, message, 0x80);
+            abort();
+        }
+    }
+    pthread_mutex_unlock(&LC32AudioLogMutex);
 }
 
 static uint32_t LC32AudioToolboxDispatch(LC32AudioToolboxOpcode opcode,
@@ -40,8 +89,11 @@ static uint32_t LC32AudioToolboxDispatch(LC32AudioToolboxOpcode opcode,
         .slotCount = slotCount,
     };
     if(slotCount) memcpy(call.slots, slots, slotCount * sizeof(*slots));
-    return LC32InvokeHostCRet32(LC32AudioToolboxDispatcherAddress,
+    const uint32_t result = LC32InvokeHostCRet32(
+        LC32AudioToolboxDispatcherAddress,
         (uint32_t)opcode, (uint32_t)(uintptr_t)&call);
+    LC32AudioLog((uint32_t)opcode, result, slots, slotCount);
+    return result;
 }
 
 #define LC32_AUDIO_CALL(opcode, ...) \
