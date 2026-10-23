@@ -5,6 +5,9 @@
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
+#include <stdarg.h>
+#include <mach-o/dyld.h>
 
 #include "../../OpenALBridge/LC32OpenALProtocol.h"
 
@@ -42,6 +45,37 @@ static void LC32OpenALDispatch(LC32OpenALOpcode opcode,
     }
 
     LC32InvokeHostCRet32(dispatcher, opcode, (uint32_t)(uintptr_t)packet);
+}
+
+
+/* Diagnostic log (no abort): appends to lc32-openal-log.txt in LiveContainer's
+ * Documents folder (visible in the Files app) and to stderr. Capped. */
+static pthread_mutex_t LC32OpenALLogMutex = PTHREAD_MUTEX_INITIALIZER;
+static unsigned LC32OpenALLogCount;
+
+static void LC32OpenALLog(const char *format, ...) {
+    char line[200];
+    va_list arguments;
+    va_start(arguments, format);
+    vsnprintf(line, sizeof(line) - 1, format, arguments);
+    va_end(arguments);
+    strcat(line, "\n");
+    pthread_mutex_lock(&LC32OpenALLogMutex);
+    if (LC32OpenALLogCount < 400) {
+        ++LC32OpenALLogCount;
+        fputs(line, stderr);
+        char exe[1024];
+        uint32_t exeSize = sizeof(exe);
+        if (_NSGetExecutablePath(exe, &exeSize) == 0) {
+            char *marker = strstr(exe, "/Documents/");
+            if (marker) {
+                strcpy(marker + strlen("/Documents/"), "lc32-openal-log.txt");
+                FILE *file = fopen(exe, "a");
+                if (file) { fputs(line, file); fclose(file); }
+            }
+        }
+    }
+    pthread_mutex_unlock(&LC32OpenALLogMutex);
 }
 
 static uint32_t LC32OpenALPointerWord(const void *pointer) {
@@ -225,9 +259,14 @@ ALdouble alGetDouble(ALenum param) {
     return LC32OpenALDoubleResult(packet.words[0], packet.words[1]);
 }
 
-LC32_OPENAL_RET0(ALenum, alGetError)
+ALenum alGetError(void) {
+    LC32_OPENAL_PACKET(); LC32_OPENAL_CALL(alGetError);
+    if (packet.words[0]) LC32OpenALLog("alGetError -> 0x%x", packet.words[0]);
+    return (ALenum)packet.words[0];
+}
 
 ALboolean alIsExtensionPresent(const ALchar *extname) {
+    LC32OpenALLog("alIsExtensionPresent(%s)", extname ? extname : "(null)");
     return extname && strcmp(extname, "AL_EXT_STATIC_BUFFER") == 0;
 }
 
@@ -269,7 +308,11 @@ LC32_OPENAL_VOID2(alSourcePlayv, ALsizei, ns, LC32_OPENAL_WORD(ns), const ALuint
 LC32_OPENAL_VOID2(alSourceStopv, ALsizei, ns, LC32_OPENAL_WORD(ns), const ALuint *, sids, LC32_OPENAL_PTR(sids))
 LC32_OPENAL_VOID2(alSourceRewindv, ALsizei, ns, LC32_OPENAL_WORD(ns), const ALuint *, sids, LC32_OPENAL_PTR(sids))
 LC32_OPENAL_VOID2(alSourcePausev, ALsizei, ns, LC32_OPENAL_WORD(ns), const ALuint *, sids, LC32_OPENAL_PTR(sids))
-LC32_OPENAL_VOID1(alSourcePlay, ALuint, sid, LC32_OPENAL_WORD(sid))
+void alSourcePlay(ALuint sid) {
+    LC32_OPENAL_PACKET(); packet.words[0] = LC32_OPENAL_WORD(sid);
+    LC32_OPENAL_CALL(alSourcePlay);
+    LC32OpenALLog("alSourcePlay(%u)", (unsigned)sid);
+}
 LC32_OPENAL_VOID1(alSourceStop, ALuint, sid, LC32_OPENAL_WORD(sid))
 LC32_OPENAL_VOID1(alSourceRewind, ALuint, sid, LC32_OPENAL_WORD(sid))
 LC32_OPENAL_VOID1(alSourcePause, ALuint, sid, LC32_OPENAL_WORD(sid))
@@ -279,7 +322,18 @@ LC32_OPENAL_VOID3(alSourceUnqueueBuffers, ALuint, sid, LC32_OPENAL_WORD(sid), AL
 LC32_OPENAL_VOID2(alGenBuffers, ALsizei, n, LC32_OPENAL_WORD(n), ALuint *, buffers, LC32_OPENAL_PTR(buffers))
 LC32_OPENAL_VOID2(alDeleteBuffers, ALsizei, n, LC32_OPENAL_WORD(n), const ALuint *, buffers, LC32_OPENAL_PTR(buffers))
 LC32_OPENAL_RET1(ALboolean, alIsBuffer, ALuint, bid, LC32_OPENAL_WORD(bid))
-LC32_OPENAL_VOID5(alBufferData, ALuint, bid, LC32_OPENAL_WORD(bid), ALenum, format, LC32_OPENAL_WORD(format), const ALvoid *, data, LC32_OPENAL_PTR(data), ALsizei, size, LC32_OPENAL_WORD(size), ALsizei, freq, LC32_OPENAL_WORD(freq))
+void alBufferData(ALuint bid, ALenum format, const ALvoid *data,
+                  ALsizei size, ALsizei freq) {
+    LC32_OPENAL_PACKET();
+    packet.words[0] = LC32_OPENAL_WORD(bid);
+    packet.words[1] = LC32_OPENAL_WORD(format);
+    packet.words[2] = LC32_OPENAL_PTR(data);
+    packet.words[3] = LC32_OPENAL_WORD(size);
+    packet.words[4] = LC32_OPENAL_WORD(freq);
+    LC32_OPENAL_CALL(alBufferData);
+    LC32OpenALLog("alBufferData(buf=%u fmt=0x%x size=%d freq=%d)",
+        (unsigned)bid, (unsigned)format, (int)size, (int)freq);
+}
 LC32_OPENAL_VOID3(alBufferf, ALuint, bid, LC32_OPENAL_WORD(bid), ALenum, param, LC32_OPENAL_WORD(param), ALfloat, value, LC32_OPENAL_FLOAT(value))
 LC32_OPENAL_VOID5(alBuffer3f, ALuint, bid, LC32_OPENAL_WORD(bid), ALenum, param, LC32_OPENAL_WORD(param), ALfloat, value1, LC32_OPENAL_FLOAT(value1), ALfloat, value2, LC32_OPENAL_FLOAT(value2), ALfloat, value3, LC32_OPENAL_FLOAT(value3))
 LC32_OPENAL_VOID3(alBufferfv, ALuint, bid, LC32_OPENAL_WORD(bid), ALenum, param, LC32_OPENAL_WORD(param), const ALfloat *, values, LC32_OPENAL_PTR(values))
@@ -298,24 +352,36 @@ LC32_OPENAL_VOID1(alSpeedOfSound, ALfloat, value, LC32_OPENAL_FLOAT(value))
 LC32_OPENAL_VOID1(alDistanceModel, ALenum, distanceModel, LC32_OPENAL_WORD(distanceModel))
 
 LC32_OPENAL_PTRRET2(ALCcontext *, alcCreateContext, ALCdevice *, device, LC32_OPENAL_PTR(device), const ALCint *, attrlist, LC32_OPENAL_PTR(attrlist))
-LC32_OPENAL_RET1(ALCboolean, alcMakeContextCurrent, ALCcontext *, context, LC32_OPENAL_PTR(context))
+ALCboolean alcMakeContextCurrent(ALCcontext *context) {
+    LC32_OPENAL_PACKET(); packet.words[0] = LC32_OPENAL_PTR(context);
+    LC32_OPENAL_CALL(alcMakeContextCurrent);
+    LC32OpenALLog("alcMakeContextCurrent(%p) -> %u", (void *)context,
+        (unsigned)packet.words[0]);
+    return (ALCboolean)packet.words[0];
+}
 LC32_OPENAL_VOID1(alcProcessContext, ALCcontext *, context, LC32_OPENAL_PTR(context))
 LC32_OPENAL_VOID1(alcSuspendContext, ALCcontext *, context, LC32_OPENAL_PTR(context))
 LC32_OPENAL_VOID1(alcDestroyContext, ALCcontext *, context, LC32_OPENAL_PTR(context))
 LC32_OPENAL_PTRRET0(ALCcontext *, alcGetCurrentContext)
 LC32_OPENAL_PTRRET1(ALCdevice *, alcGetContextsDevice, ALCcontext *, context, LC32_OPENAL_PTR(context))
-LC32_OPENAL_PTRRET1(ALCdevice *, alcOpenDevice, const ALCchar *, devicename, LC32_OPENAL_PTR(devicename))
+ALCdevice *alcOpenDevice(const ALCchar *devicename) {
+    LC32_OPENAL_PACKET(); packet.words[0] = LC32_OPENAL_PTR(devicename);
+    LC32_OPENAL_CALL(alcOpenDevice);
+    LC32OpenALLog("alcOpenDevice -> %p", (void *)(uintptr_t)packet.words[0]);
+    return (ALCdevice *)(uintptr_t)packet.words[0];
+}
 LC32_OPENAL_RET1(ALCboolean, alcCloseDevice, ALCdevice *, device, LC32_OPENAL_PTR(device))
 LC32_OPENAL_RET1(ALCenum, alcGetError, ALCdevice *, device, LC32_OPENAL_PTR(device))
 
 ALCboolean alcIsExtensionPresent(ALCdevice *device, const ALCchar *extname) {
     (void)device;
-    (void)extname;
+    LC32OpenALLog("alcIsExtensionPresent(%s)", extname ? extname : "(null)");
     return ALC_FALSE;
 }
 
 void *alcGetProcAddress(ALCdevice *device, const ALCchar *funcname) {
     (void)device;
+    LC32OpenALLog("alcGetProcAddress(%s)", funcname ? funcname : "(null)");
     return LC32OpenALLookupALCProc(funcname);
 }
 
