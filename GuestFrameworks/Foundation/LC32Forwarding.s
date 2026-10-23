@@ -7,12 +7,16 @@
 .global _LC32GuestForwardMessage
 _LC32GuestForwardMessage:
     mov r12, #0
-    b 1f
+    b _LC32GuestForwardMessageCommon
 
 .global _LC32GuestForwardMessageStret
 _LC32GuestForwardMessageStret:
     mov r12, #1
-1:
+// A real symbol (not a local "1:" label) so crash reports attribute the shared
+// body to itself instead of to _LC32GuestForwardMessageStret. Both entry points
+// run this code, so a Stret frame in a stack trace does not mean struct return.
+.private_extern _LC32GuestForwardMessageCommon
+_LC32GuestForwardMessageCommon:
     push {r0, r1, r2, r3}
     push {r4, lr}
     mov r4, r12

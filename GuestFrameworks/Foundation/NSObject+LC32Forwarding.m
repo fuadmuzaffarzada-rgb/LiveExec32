@@ -3,6 +3,8 @@
 #import <objc/runtime.h>
 #include <LC32PODType.h>
 
+#include <dlfcn.h>
+#include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -12,13 +14,32 @@ extern void LC32GuestForwardMessage(void);
 extern void LC32GuestForwardMessageStret(void);
 
 static void LC32ForwardingFailure(id receiver, SEL selector,
-        const char *reason) __attribute__((noreturn));
+        const char *format, ...) __attribute__((noreturn, format(printf, 3, 4)));
 static void LC32ForwardingFailure(id receiver, SEL selector,
-        const char *reason) {
-    fprintf(stderr, "LC32: cannot forward guest %c[%s %s]: %s\n",
+        const char *format, ...) {
+    char reason[256];
+    va_list arguments;
+    va_start(arguments, format);
+    vsnprintf(reason, sizeof(reason), format, arguments);
+    va_end(arguments);
+
+    static char message[512];
+    snprintf(message, sizeof(message), "LC32: cannot forward guest %c[%s %s]: %s",
         object_isClass(receiver) ? '+' : '-',
         receiver ? class_getName(object_getClass(receiver)) : "(nil)",
         selector ? sel_getName(selector) : "(null)", reason);
+    fprintf(stderr, "%s\n", message);
+    fflush(stderr);
+
+    /* Put the selector in the crash report itself. LiveExec32 records the
+     * reason string of abort_with_reason() and prints it in the report, so a
+     * stripped game binary no longer hides which message failed. The symbol is
+     * looked up at run time because older guest libsystem_kernel images may
+     * not export it; plain abort() remains the fallback. */
+    typedef void (*AbortWithReason)(uint32_t, uint64_t, const char *, uint64_t);
+    AbortWithReason abortWithReason =
+        (AbortWithReason)dlsym(RTLD_DEFAULT, "abort_with_reason");
+    if(abortWithReason) abortWithReason(8 /* OS_REASON_OBJC */, 1, message, 0);
     abort();
 }
 
@@ -78,8 +99,16 @@ uint64_t LC32GuestForwardInvocation(const uint32_t *words, uint32_t stret) {
     id receiver = (id)(uintptr_t)words[stret ? 1 : 0];
     SEL selector = (SEL)(uintptr_t)words[stret ? 2 : 1];
     if(stret) {
+        /* Name the struct that was returned so the report says what to add. */
+        char returnType[128] = "?";
+        if(receiver && selector && class_getInstanceMethod(
+                object_getClass(receiver), @selector(methodSignatureForSelector:))) {
+            NSMethodSignature *probe = [receiver methodSignatureForSelector:selector];
+            if(probe) LC32ForwardingCopyType(probe, 0, YES, returnType, sizeof(returnType));
+        }
         LC32ForwardingFailure(receiver, selector,
-            "aggregate return requires an unsupported full-forwarding ABI");
+            "aggregate return (%s) requires an unsupported full-forwarding ABI",
+            returnType);
     }
     /* Legacy NSObject class versioning (+version / +setVersion:) is provided
      * by Foundation on iOS but not by the guest shim. Answer it here as a
@@ -112,7 +141,8 @@ uint64_t LC32GuestForwardInvocation(const uint32_t *words, uint32_t stret) {
 
     const NSUInteger argumentCount = signature.numberOfArguments;
     if(argumentCount < 2 || argumentCount > 34) {
-        LC32ForwardingFailure(receiver, selector, "unsupported argument count");
+        LC32ForwardingFailure(receiver, selector,
+            "unsupported argument count %lu", (unsigned long)argumentCount);
     }
     char type[256];
     if(!LC32ForwardingCopyType(signature, 0, YES, type, sizeof(type))) {
@@ -120,7 +150,8 @@ uint64_t LC32GuestForwardInvocation(const uint32_t *words, uint32_t stret) {
     }
     const unsigned resultWords = LC32ForwardingTypeWords(type, YES);
     if(resultWords == UINT32_MAX) {
-        LC32ForwardingFailure(receiver, selector, "unsupported return encoding");
+        LC32ForwardingFailure(receiver, selector,
+            "unsupported return encoding %s", type);
     }
     const char *unqualifiedResult = type;
     while(*unqualifiedResult && strchr("rnNoORVA", *unqualifiedResult))
@@ -133,7 +164,9 @@ uint64_t LC32GuestForwardInvocation(const uint32_t *words, uint32_t stret) {
         }
         widths[index - 2] = LC32ForwardingTypeWords(type, NO);
         if(widths[index - 2] == UINT32_MAX) {
-            LC32ForwardingFailure(receiver, selector, "unsupported argument encoding");
+            LC32ForwardingFailure(receiver, selector,
+                "unsupported argument %lu encoding %s",
+                (unsigned long)index, type);
         }
     }
     if(!class_getInstanceMethod(object_getClass(receiver), @selector(forwardInvocation:))) {
