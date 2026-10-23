@@ -2029,6 +2029,28 @@ OSStatus DispatchAudioConverterDispose(
     return status;
 }
 
+OSStatus DispatchAudioConverterReset(
+        const LC32AudioToolboxCall &call) {
+    if(!RequireSlots(call, 1)) return kAudio_ParamError;
+    auto entry = FindAudioConverter(SlotU32(call, 0));
+    if(!entry) return kAudio_ParamError;
+
+    std::lock_guard<std::mutex> lock(entry->mutex);
+    if(!entry->converter) return kAudio_ParamError;
+    OSStatus status;
+    {
+        AudioToolboxGuestHostCallQuiescence quiescence;
+        status = AudioConverterReset(entry->converter);
+    }
+    /* Reset discards any input the converter retained from earlier
+     * callbacks, so the copied guest storage can be released too. */
+    if(status == noErr) {
+        entry->callbackAudioStorage.clear();
+        entry->callbackPacketDescriptions.clear();
+    }
+    return status;
+}
+
 OSStatus DispatchAudioConverterFillComplexBuffer(
         const LC32AudioToolboxCall &call) {
     if(!RequireSlots(call, 6) || !SlotU32(call, 1) ||
@@ -4062,6 +4084,9 @@ extern "C" u32 LC32_AudioToolbox_Dispatch(u32 opcode, u32 guestCall, u32) {
         case LC32AudioToolboxOpAudioConverterDispose:
             return static_cast<u32>(
                 DispatchAudioConverterDispose(call));
+        case LC32AudioToolboxOpAudioConverterReset:
+            return static_cast<u32>(
+                DispatchAudioConverterReset(call));
         case LC32AudioToolboxOpAudioConverterFillComplexBuffer:
             return static_cast<u32>(
                 DispatchAudioConverterFillComplexBuffer(call));
