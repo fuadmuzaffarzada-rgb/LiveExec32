@@ -856,6 +856,7 @@ static LC32SilentAudioPump *LC32SilentAudioCreatePump(
 static void *LC32SilentAudioPumpMain(void *context) {
     LC32SilentAudioPump *pump = context;
     Float64 sampleTime = 0;
+    unsigned consecutiveSubmitTimeouts = 0;
     while(!__atomic_load_n(&pump->unit->stopRequested,
                            __ATOMIC_ACQUIRE)) {
         if(!__atomic_load_n(&pump->unit->started, __ATOMIC_ACQUIRE)) {
@@ -917,9 +918,20 @@ static void *LC32SilentAudioPumpMain(void *context) {
                 /* Waiting for a returned native AudioQueue buffer supplies
                  * the pacing for the next render quantum. */
                 hostPaced = YES;
+                consecutiveSubmitTimeouts = 0;
+            } else if(submitStatus == -66745 /* kAudioUnitErr_RenderTimeout */ &&
+                      ++consecutiveSubmitTimeouts < 16) {
+                /* The host queue can need a while to start consuming buffers
+                 * (route/session start-up). One slow submit must not switch
+                 * host output off for the rest of the run, so keep the host
+                 * path and retry; only a long run of timeouts gives up. */
+                LC32AudioLogLine("RemoteIO submit timeout %u (retrying)",
+                    consecutiveSubmitTimeouts);
             } else {
                 __atomic_store_n(&pump->unit->hostOutputHealthy, 0,
                     __ATOMIC_RELEASE);
+                LC32AudioLogLine("RemoteIO host output disabled, status=%d",
+                    (int)submitStatus);
 #if LC32_TRACE_AUDIO_OUTPUT
                 fprintf(stderr,
                     "LC32: RemoteIO output submit failed: status=%d\n",
