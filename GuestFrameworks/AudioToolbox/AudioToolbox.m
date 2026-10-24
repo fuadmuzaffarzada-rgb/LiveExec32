@@ -17,6 +17,7 @@
 
 #include <dlfcn.h>
 #include <stdio.h>
+#include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -30,10 +31,43 @@ static void LC32AudioToolboxResolveDispatcher(void) {
         LC32Dlsym("LC32_AudioToolbox_Dispatch", YES);
 }
 
-/* Logging only (no abort): prints the audio setup calls the game makes to
- * stderr as "LC32AudioLog #n op=.. arg0=0x.. status=..". Capped at 200 lines. */
+/* Logging only (no abort). Lines go to stderr and to lc32-audio-log.txt in
+ * LiveContainer's Documents folder. Identical consecutive events are folded
+ * ("N identical suppressed") so polling loops cannot fill the log. */
 static pthread_mutex_t LC32AudioLogMutex = PTHREAD_MUTEX_INITIALIZER;
 static unsigned LC32AudioLogEvents;
+static uint64_t LC32AudioLogLastKey;
+static unsigned LC32AudioLogRepeats;
+
+static void LC32AudioLogLocked(const char *line) {
+    if(LC32AudioLogEvents >= 800) return;
+    ++LC32AudioLogEvents;
+    fputs(line, stderr);
+    char exe[1024];
+    uint32_t exeSize = sizeof(exe);
+    if(_NSGetExecutablePath(exe, &exeSize) == 0) {
+        char *marker = strstr(exe, "/Documents/");
+        if(marker) {
+            strcpy(marker + strlen("/Documents/"), "lc32-audio-log.txt");
+            FILE *file = fopen(exe, "a");
+            if(file) { fputs(line, file); fclose(file); }
+        }
+    }
+}
+
+static void LC32AudioLogLine(const char *format, ...)
+        __attribute__((format(printf, 1, 2)));
+static void LC32AudioLogLine(const char *format, ...) {
+    char line[256];
+    va_list arguments;
+    va_start(arguments, format);
+    vsnprintf(line, sizeof(line) - 2, format, arguments);
+    va_end(arguments);
+    strcat(line, "\n");
+    pthread_mutex_lock(&LC32AudioLogMutex);
+    LC32AudioLogLocked(line);
+    pthread_mutex_unlock(&LC32AudioLogMutex);
+}
 
 static void LC32AudioLog(uint32_t opcode, uint32_t status,
                          const uint64_t *slots, uint32_t slotCount) {
@@ -47,26 +81,30 @@ static void LC32AudioLog(uint32_t opcode, uint32_t status,
         opcode == LC32AudioToolboxOpExtAudioFileOpenURL ||
         opcode == LC32AudioToolboxOpAudioFileOpenURL;
     if(!setup && status == 0) return;
+    const unsigned arg0 = slotCount > 0 ? (unsigned)slots[0] : 0;
+    const uint64_t key = ((uint64_t)opcode << 48) ^ ((uint64_t)arg0 << 16) ^
+        (uint64_t)(status & 0xffff);
     pthread_mutex_lock(&LC32AudioLogMutex);
-    if(LC32AudioLogEvents < 200) {
-        ++LC32AudioLogEvents;
-        char line[120];
-        snprintf(line, sizeof(line),
-            "LC32AudioLog #%u op=%u arg0=0x%x status=%d\n",
-            LC32AudioLogEvents, opcode,
-            slotCount > 0 ? (unsigned)slots[0] : 0, (int)status);
-        fputs(line, stderr);
-        char exe[1024];
-        uint32_t exeSize = sizeof(exe);
-        if(_NSGetExecutablePath(exe, &exeSize) == 0) {
-            char *marker = strstr(exe, "/Documents/");
-            if(marker) {
-                strcpy(marker + strlen("/Documents/"), "lc32-audio-log.txt");
-                FILE *file = fopen(exe, "a");
-                if(file) { fputs(line, file); fclose(file); }
-            }
+    if(key == LC32AudioLogLastKey) {
+        ++LC32AudioLogRepeats;
+        if(LC32AudioLogRepeats > 2) {
+            pthread_mutex_unlock(&LC32AudioLogMutex);
+            return;
         }
+    } else {
+        if(LC32AudioLogRepeats > 2) {
+            char note[80];
+            snprintf(note, sizeof(note), "  (%u identical events suppressed)\n",
+                LC32AudioLogRepeats - 2);
+            LC32AudioLogLocked(note);
+        }
+        LC32AudioLogLastKey = key;
+        LC32AudioLogRepeats = 1;
     }
+    char line[120];
+    snprintf(line, sizeof(line),
+        "LC32AudioLog op=%u arg0=0x%x status=%d\n", opcode, arg0, (int)status);
+    LC32AudioLogLocked(line);
     pthread_mutex_unlock(&LC32AudioLogMutex);
 }
 
@@ -1713,7 +1751,8 @@ OSStatus AudioConverterFillComplexBuffer(
        !ioOutputDataPacketSize || !outOutputData) {
         return kAudio_ParamError;
     }
-    return (OSStatus)LC32_AUDIO_CALL(
+    const UInt32 requestedPackets = *ioOutputDataPacketSize;
+    const OSStatus fillStatus = (OSStatus)LC32_AUDIO_CALL(
         LC32AudioToolboxOpAudioConverterFillComplexBuffer,
         LC32_AUDIO_U32((uintptr_t)inAudioConverter),
         LC32_AUDIO_U32((uintptr_t)inInputDataProc),
@@ -1721,6 +1760,23 @@ OSStatus AudioConverterFillComplexBuffer(
         LC32_AUDIO_U32((uintptr_t)ioOutputDataPacketSize),
         LC32_AUDIO_U32((uintptr_t)outOutputData),
         LC32_AUDIO_U32((uintptr_t)outPacketDescription));
+    static unsigned fillFailures;
+    if(fillStatus != noErr && fillFailures < 12) {
+        ++fillFailures;
+        const UInt32 count = outOutputData->mNumberBuffers;
+        LC32AudioLogLine("FillComplexBuffer status=%d requestedPackets=%u "
+            "returnedPackets=%u buffers=%u packetDesc=%d", (int)fillStatus,
+            (unsigned)requestedPackets, (unsigned)*ioOutputDataPacketSize,
+            (unsigned)count, outPacketDescription != NULL);
+        for(UInt32 i = 0; i < count && i < 4; ++i) {
+            LC32AudioLogLine("  out[%u] channels=%u bytes=%u data=%d",
+                (unsigned)i,
+                (unsigned)outOutputData->mBuffers[i].mNumberChannels,
+                (unsigned)outOutputData->mBuffers[i].mDataByteSize,
+                outOutputData->mBuffers[i].mData != NULL);
+        }
+    }
+    return fillStatus;
 }
 
 OSStatus AudioQueueFlush(AudioQueueRef inAQ) {
@@ -2272,11 +2328,21 @@ OSStatus AudioSessionGetProperty(AudioSessionPropertyID property,
                                  UInt32 *ioDataSize,
                                  void *outData) {
     if(!ioDataSize) return kAudio_ParamError;
-    return (OSStatus)LC32_AUDIO_CALL(
+    const OSStatus getStatus = (OSStatus)LC32_AUDIO_CALL(
         LC32AudioToolboxOpAudioSessionGetProperty,
         LC32_AUDIO_U32(property),
         LC32_AUDIO_U32((uintptr_t)ioDataSize),
         LC32_AUDIO_U32((uintptr_t)outData));
+    if(property == 'othr' && outData && getStatus == noErr &&
+       *ioDataSize >= sizeof(UInt32)) {
+        static int lastValue = -1;
+        const int value = (int)*(UInt32 *)outData;
+        if(value != lastValue) {
+            lastValue = value;
+            LC32AudioLogLine("OtherAudioIsPlaying value changed to %d", value);
+        }
+    }
+    return getStatus;
 }
 
 #pragma mark Audio File Services
