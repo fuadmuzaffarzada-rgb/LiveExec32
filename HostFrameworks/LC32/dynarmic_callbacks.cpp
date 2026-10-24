@@ -3,6 +3,15 @@
 #include "darwin_file_syscalls.h"
 #include "crash_exception.h"
 
+#include <atomic>
+#include <chrono>
+#include <string>
+
+/* DIAGNOSTIC: remembers which unimplemented Darwin syscalls the guest hit and
+ * reports them in a crash report once the game has run for 15 seconds. */
+static std::atomic<uint64_t> LC32DiagUnimplemented[16];
+static std::atomic<bool> LC32DiagSyscallReported{false};
+
 namespace {
 struct GuestCrashExceptionPayload {
     std::string report;
@@ -941,6 +950,32 @@ public:
 #if TRACE_SVC
         printf("CallSVC(NR=%d)\n", NR);
 #endif
+
+        {
+            static std::atomic<unsigned> diagCalls{0};
+            static const auto diagStart = std::chrono::steady_clock::now();
+            if ((diagCalls.fetch_add(1, std::memory_order_relaxed) & 0x3FF) ==
+                    0x3FF &&
+                std::chrono::steady_clock::now() - diagStart >
+                    std::chrono::seconds(15) &&
+                !LC32DiagSyscallReported.exchange(true)) {
+                std::string list;
+                for (int n = 1; n < 1000; ++n) {
+                    if (LC32DiagUnimplemented[n / 64].load(
+                            std::memory_order_relaxed) &
+                        (1ull << (n % 64))) {
+                        list += std::to_string(n);
+                        list += ' ';
+                    }
+                }
+                if (list.empty()) list = "(none)";
+                SetPendingGuestCrashMessage(
+                    "LC32 syscall diag, unimplemented syscalls seen: %s",
+                    list.c_str());
+                DumpCrashReport();
+                return;
+            }
+        }
 
         cpsr->setCarry(false);
 /*
@@ -2460,6 +2495,8 @@ BE CAREFUL WHEN MOVING SYSCALL. Checklist:
             }
             default:
                 if (NR > 0 && NR < 1000) {
+                    LC32DiagUnimplemented[NR / 64].fetch_or(
+                        1ull << (NR % 64), std::memory_order_relaxed);
                     /* Keep ordinary guest feature probes recoverable. The
                      * explicit list above uses EPERM for operations that an
                      * app process must not apply to its native host; other
