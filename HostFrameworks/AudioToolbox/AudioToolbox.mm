@@ -461,14 +461,8 @@ struct AudioConverterInputContext {
     std::vector<AudioStreamPacketDescription> *packetDescriptions = nullptr;
 };
 
-/* DIAGNOSTIC: converter failures return -(100000 + source line) instead of -50
- * so the audio log shows exactly which check rejected the call. Remove once the
- * cause is fixed. */
-#define LC32_PARAM_ERROR() \
-    (static_cast<OSStatus>(-100000 - static_cast<int>(__LINE__)))
-
 OSStatus AudioConverterInputCallbackBridge(
-        AudioConverterRef, UInt32 *ioNumberDataPackets,
+        AudioConverterRef nativeConverter, UInt32 *ioNumberDataPackets,
         AudioBufferList *ioData,
         AudioStreamPacketDescription **outDataPacketDescription,
         void *rawContext) noexcept {
@@ -480,7 +474,7 @@ OSStatus AudioConverterInputCallbackBridge(
        !context->audioStorage || !context->packetDescriptions ||
        !Dynarmic_guest_thread_is_registered()) {
         if(ioNumberDataPackets) *ioNumberDataPackets = 0;
-        return LC32_PARAM_ERROR();
+        return kAudio_ParamError;
     }
 
     try {
@@ -492,7 +486,7 @@ OSStatus AudioConverterInputCallbackBridge(
         if(nativeBufferCapacity == 0 ||
            nativeBufferCapacity > kMaximumAudioBuffers ||
            !context->storage->Prepare(requestedPackets, ioData))
-            return LC32_PARAM_ERROR();
+            return kAudio_ParamError;
 
         u32 arguments[] = {
             context->guestConverter,
@@ -510,7 +504,7 @@ OSStatus AudioConverterInputCallbackBridge(
         if(!ReadGuestU32(context->storage->packetCount(),
                 returnedPackets) ||
            returnedPackets > kMaximumAudioBytes) {
-            return LC32_PARAM_ERROR();
+            return kAudio_ParamError;
         }
         if(status != noErr) return status;
 
@@ -520,7 +514,7 @@ OSStatus AudioConverterInputCallbackBridge(
            bufferCount > nativeBufferCapacity ||
            bufferCount > kMaximumAudioBuffers ||
            (returnedPackets && bufferCount == 0)) {
-            return LC32_PARAM_ERROR();
+            return kAudio_ParamError;
         }
         ioData->mNumberBuffers = bufferCount;
         if(bufferCount) {
@@ -530,7 +524,7 @@ OSStatus AudioConverterInputCallbackBridge(
             if(!ReadGuestBytes(guestBuffersAddress,
                     guestBuffers.size() * sizeof(GuestAudioBuffer),
                     guestBuffers.data())) {
-                return LC32_PARAM_ERROR();
+                return kAudio_ParamError;
             }
 
             size_t totalBytes = 0;
@@ -541,14 +535,14 @@ OSStatus AudioConverterInputCallbackBridge(
                    (guest.byteSize && (!guest.data ||
                     static_cast<uint64_t>(guest.data) + guest.byteSize >
                         static_cast<uint64_t>(UINT32_MAX) + 1))) {
-                    return LC32_PARAM_ERROR();
+                    return kAudio_ParamError;
                 }
                 totalBytes += guest.byteSize;
                 (*context->audioStorage)[index].resize(guest.byteSize);
                 if(guest.byteSize && !ReadGuestBytes(
                         guest.data, guest.byteSize,
                         (*context->audioStorage)[index].data())) {
-                    return LC32_PARAM_ERROR();
+                    return kAudio_ParamError;
                 }
                 ioData->mBuffers[index].mNumberChannels = guest.channels;
                 ioData->mBuffers[index].mDataByteSize = guest.byteSize;
@@ -560,24 +554,49 @@ OSStatus AudioConverterInputCallbackBridge(
         u32 guestPacketDescriptions = 0;
         if(!ReadGuestU32(context->storage->packetDescriptions(),
                 guestPacketDescriptions)) {
-            return LC32_PARAM_ERROR();
+            return kAudio_ParamError;
         }
         if(outDataPacketDescription && returnedPackets &&
            !guestPacketDescriptions) {
-            return LC32_PARAM_ERROR();
+            /* The host converter asks for packet descriptions, but the guest
+             * callback did not supply any. Old games only fill them in for
+             * variable-size packet formats, so for a constant-size format
+             * (mBytesPerPacket != 0) build the descriptions here instead of
+             * failing the whole conversion with paramErr (-50). */
+            AudioStreamBasicDescription inputFormat = {};
+            UInt32 inputFormatSize = sizeof(inputFormat);
+            if(!nativeConverter ||
+               AudioConverterGetProperty(nativeConverter,
+                    kAudioConverterCurrentInputStreamDescription,
+                    &inputFormatSize, &inputFormat) != noErr ||
+               inputFormat.mBytesPerPacket == 0 ||
+               returnedPackets > kMaximumAudioBytes /
+                    sizeof(AudioStreamPacketDescription)) {
+                return kAudio_ParamError;
+            }
+            context->packetDescriptions->resize(returnedPackets);
+            for(u32 index = 0; index < returnedPackets; ++index) {
+                AudioStreamPacketDescription &description =
+                    (*context->packetDescriptions)[index];
+                description.mStartOffset = static_cast<SInt64>(index) *
+                    inputFormat.mBytesPerPacket;
+                description.mVariableFramesInPacket = 0;
+                description.mDataByteSize = inputFormat.mBytesPerPacket;
+            }
+            *outDataPacketDescription = context->packetDescriptions->data();
         }
         if(guestPacketDescriptions && returnedPackets) {
             if(returnedPackets >
                     kMaximumAudioBytes /
                         sizeof(AudioStreamPacketDescription)) {
-                return LC32_PARAM_ERROR();
+                return kAudio_ParamError;
             }
             context->packetDescriptions->resize(returnedPackets);
             if(!ReadGuestBytes(guestPacketDescriptions,
                     context->packetDescriptions->size() *
                         sizeof(AudioStreamPacketDescription),
                     context->packetDescriptions->data())) {
-                return LC32_PARAM_ERROR();
+                return kAudio_ParamError;
             }
             if(outDataPacketDescription) {
                 *outDataPacketDescription =
@@ -589,7 +608,7 @@ OSStatus AudioConverterInputCallbackBridge(
     } catch(const std::bad_alloc &) {
         return kAudio_MemFullError;
     } catch(...) {
-        return LC32_PARAM_ERROR();
+        return kAudio_ParamError;
     }
 }
 
@@ -2072,10 +2091,10 @@ OSStatus DispatchAudioConverterFillComplexBuffer(
         const LC32AudioToolboxCall &call) {
     if(!RequireSlots(call, 6) || !SlotU32(call, 1) ||
        !SlotU32(call, 3) || !SlotU32(call, 4)) {
-        return LC32_PARAM_ERROR();
+        return kAudio_ParamError;
     }
     auto entry = FindAudioConverter(SlotU32(call, 0));
-    if(!entry) return LC32_PARAM_ERROR();
+    if(!entry) return kAudio_ParamError;
 
     try {
         u32 requestedPackets = 0;
@@ -2088,7 +2107,7 @@ OSStatus DispatchAudioConverterFillComplexBuffer(
            (SlotU32(call, 5) && requestedPackets >
                 kMaximumAudioBytes /
                     sizeof(AudioStreamPacketDescription))) {
-            return LC32_PARAM_ERROR();
+            return kAudio_ParamError;
         }
 
         const uint64_t guestBuffersAddress =
@@ -2099,12 +2118,12 @@ OSStatus DispatchAudioConverterFillComplexBuffer(
         if(guestBuffersAddress > UINT32_MAX ||
            guestBuffersAddress + guestBuffersBytes >
                 static_cast<uint64_t>(UINT32_MAX) + 1) {
-            return LC32_PARAM_ERROR();
+            return kAudio_ParamError;
         }
         std::vector<GuestAudioBuffer> guestBuffers(outputBufferCount);
         if(!ReadGuestBytes(static_cast<u32>(guestBuffersAddress),
                 guestBuffersBytes, guestBuffers.data())) {
-            return LC32_PARAM_ERROR();
+            return kAudio_ParamError;
         }
 
         size_t totalAudioBytes = 0;
@@ -2123,7 +2142,7 @@ OSStatus DispatchAudioConverterFillComplexBuffer(
                (guest.byteSize && (!guest.data ||
                 static_cast<uint64_t>(guest.data) + guest.byteSize >
                     static_cast<uint64_t>(UINT32_MAX) + 1))) {
-                return LC32_PARAM_ERROR();
+                return kAudio_ParamError;
             }
             totalAudioBytes += guest.byteSize;
             outputStorage[index].resize(guest.byteSize);
@@ -2152,7 +2171,7 @@ OSStatus DispatchAudioConverterFillComplexBuffer(
         OSStatus status;
         {
             std::lock_guard<std::mutex> lock(entry->mutex);
-            if(!entry->converter) return LC32_PARAM_ERROR();
+            if(!entry->converter) return kAudio_ParamError;
             AudioToolboxGuestHostCallQuiescence quiescence;
             status = AudioConverterFillComplexBuffer(
                 entry->converter, AudioConverterInputCallbackBridge,
@@ -2166,13 +2185,13 @@ OSStatus DispatchAudioConverterFillComplexBuffer(
            returnedBufferCount > outputBufferCount ||
            !WriteGuestU32(SlotU32(call, 3), returnedPackets) ||
            !WriteGuestU32(SlotU32(call, 4), returnedBufferCount)) {
-            return LC32_PARAM_ERROR();
+            return kAudio_ParamError;
         }
         for(u32 index = 0; index < returnedBufferCount; ++index) {
             const AudioBuffer &host = hostList->mBuffers[index];
             if(host.mDataByteSize > guestBuffers[index].byteSize ||
                (host.mDataByteSize && !host.mData)) {
-                return LC32_PARAM_ERROR();
+                return kAudio_ParamError;
             }
             const u32 guestBufferAddress = static_cast<u32>(
                 guestBuffersAddress +
@@ -2187,7 +2206,7 @@ OSStatus DispatchAudioConverterFillComplexBuffer(
                (host.mDataByteSize && !WriteGuestBytes(
                     guestBuffers[index].data, host.mDataByteSize,
                     host.mData))) {
-                return LC32_PARAM_ERROR();
+                return kAudio_ParamError;
             }
         }
         if(!packetDescriptions.empty() && returnedPackets &&
@@ -2195,13 +2214,13 @@ OSStatus DispatchAudioConverterFillComplexBuffer(
                 static_cast<size_t>(returnedPackets) *
                     sizeof(AudioStreamPacketDescription),
                 packetDescriptions.data())) {
-            return LC32_PARAM_ERROR();
+            return kAudio_ParamError;
         }
         return status;
     } catch(const std::bad_alloc &) {
         return kAudio_MemFullError;
     } catch(...) {
-        return LC32_PARAM_ERROR();
+        return kAudio_ParamError;
     }
 }
 
