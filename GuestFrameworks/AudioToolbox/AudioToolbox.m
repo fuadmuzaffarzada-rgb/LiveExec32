@@ -1752,6 +1752,8 @@ OSStatus AudioConverterFillComplexBuffer(
         return kAudio_ParamError;
     }
     const UInt32 requestedPackets = *ioOutputDataPacketSize;
+    const UInt32 bytesBefore = outOutputData->mNumberBuffers
+        ? outOutputData->mBuffers[0].mDataByteSize : 0;
     const OSStatus fillStatus = (OSStatus)LC32_AUDIO_CALL(
         LC32AudioToolboxOpAudioConverterFillComplexBuffer,
         LC32_AUDIO_U32((uintptr_t)inAudioConverter),
@@ -1765,9 +1767,11 @@ OSStatus AudioConverterFillComplexBuffer(
         ++fillFailures;
         const UInt32 count = outOutputData->mNumberBuffers;
         LC32AudioLogLine("FillComplexBuffer status=%d requestedPackets=%u "
-            "returnedPackets=%u buffers=%u packetDesc=%d", (int)fillStatus,
+            "returnedPackets=%u buffers=%u packetDesc=%d bytesBefore=%u",
+            (int)fillStatus,
             (unsigned)requestedPackets, (unsigned)*ioOutputDataPacketSize,
-            (unsigned)count, outPacketDescription != NULL);
+            (unsigned)count, outPacketDescription != NULL,
+            (unsigned)bytesBefore);
         for(UInt32 i = 0; i < count && i < 4; ++i) {
             LC32AudioLogLine("  out[%u] channels=%u bytes=%u data=%d",
                 (unsigned)i,
