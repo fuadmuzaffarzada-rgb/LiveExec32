@@ -6,6 +6,7 @@
 
 #include <poll.h>
 #include <atomic>
+#include <mutex>
 #include <strings.h>
 #include <net/if.h>
 #include <sys/sockio.h>
@@ -4078,17 +4079,21 @@ void CloseAllGuestAesFileDescriptors() {
     guestAesFileDescriptors.clear();
 }
 
-/* Diagnostic only: records failed open() calls and successful opens of audio
- * files to lc32-open-log.txt in LiveContainer's Documents folder, to find out
- * why a game's music does not play. Never changes the open() result. */
+/* Diagnostic only: records open() calls (success and failure) for music/audio
+ * files, plus failures of anything that is not the normal "english/" localized
+ * lookup, to lc32-open-log.txt in LiveContainer's Documents folder. Identical
+ * consecutive lines are folded. Never changes the open() result. */
 static void LC32LogGuestOpen(const char *guestPath, const char *hostPath,
                              bool failed, int value) {
-    static std::atomic<unsigned> failedCount{0};
-    static std::atomic<unsigned> audioCount{0};
+    static std::mutex logMutex;
     static char logPath[PATH_MAX];
-    static std::atomic<bool> logPathReady{false};
+    static bool logPathReady = false;
+    static char lastLine[PATH_MAX + 64];
+    static unsigned repeats = 0;
+    static unsigned lines = 0;
 
-    if(!logPathReady.load() && hostPath) {
+    std::lock_guard<std::mutex> lock(logMutex);
+    if(!logPathReady && hostPath) {
         const char *marker = strstr(hostPath, "/Documents/");
         if(marker) {
             const size_t prefix = static_cast<size_t>(marker - hostPath) +
@@ -4096,13 +4101,14 @@ static void LC32LogGuestOpen(const char *guestPath, const char *hostPath,
             if(prefix + 24 < sizeof(logPath)) {
                 memcpy(logPath, hostPath, prefix);
                 strcpy(logPath + prefix, "lc32-open-log.txt");
-                logPathReady.store(true);
+                logPathReady = true;
             }
         }
     }
-    if(!logPathReady.load()) return;
+    if(!logPathReady || lines >= 600) return;
 
-    bool audio = false;
+    bool audio = strstr(guestPath, "music") != nullptr ||
+        strstr(guestPath, "sound") != nullptr;
     const char *dot = strrchr(guestPath, '.');
     if(dot) {
         static const char *const extensions[] = {
@@ -4113,18 +4119,23 @@ static void LC32LogGuestOpen(const char *guestPath, const char *hostPath,
             if(strcasecmp(dot, extension) == 0) { audio = true; break; }
         }
     }
-    if(failed) {
-        if(failedCount.fetch_add(1) >= 300) return;
-    } else if(audio) {
-        if(audioCount.fetch_add(1) >= 100) return;
-    } else {
-        return;
-    }
+    const bool normalLocalizedMiss =
+        failed && strncmp(guestPath, "english/", 8) == 0;
+    if(!audio && (!failed || normalLocalizedMiss)) return;
+
+    char line[PATH_MAX + 64];
+    snprintf(line, sizeof(line), "%s %s value=%d", failed ? "FAIL" : "OPEN",
+        guestPath, value);
+    if(strcmp(line, lastLine) == 0) { ++repeats; return; }
     FILE *file = fopen(logPath, "a");
     if(!file) return;
-    fprintf(file, "%s %s value=%d\n", failed ? "FAIL" : "OPEN", guestPath,
-        value);
+    if(repeats) fprintf(file, "  (previous line repeated %u more times)\n",
+        repeats);
+    repeats = 0;
+    strcpy(lastLine, line);
+    fprintf(file, "%s\n", line);
     fclose(file);
+    ++lines;
 }
 
 int guest_open(int NR, u32 guest_path, int oflag, int mode) {
