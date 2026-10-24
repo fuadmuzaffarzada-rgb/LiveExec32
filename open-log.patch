@@ -1,0 +1,76 @@
+--- /tmp/dynarmic_syscalls.orig.cpp	2026-10-24 09:21:42.358109991 +0000
++++ dynarmic_syscalls.cpp	2026-10-24 09:21:42.408890200 +0000
+@@ -5,6 +5,8 @@
+ #include "guest_mach_messages.h"
+ 
+ #include <poll.h>
++#include <atomic>
++#include <strings.h>
+ #include <net/if.h>
+ #include <sys/sockio.h>
+ 
+@@ -4076,6 +4078,55 @@
+     guestAesFileDescriptors.clear();
+ }
+ 
++/* Diagnostic only: records failed open() calls and successful opens of audio
++ * files to lc32-open-log.txt in LiveContainer's Documents folder, to find out
++ * why a game's music does not play. Never changes the open() result. */
++static void LC32LogGuestOpen(const char *guestPath, const char *hostPath,
++                             bool failed, int value) {
++    static std::atomic<unsigned> failedCount{0};
++    static std::atomic<unsigned> audioCount{0};
++    static char logPath[PATH_MAX];
++    static std::atomic<bool> logPathReady{false};
++
++    if(!logPathReady.load() && hostPath) {
++        const char *marker = strstr(hostPath, "/Documents/");
++        if(marker) {
++            const size_t prefix = static_cast<size_t>(marker - hostPath) +
++                strlen("/Documents/");
++            if(prefix + 24 < sizeof(logPath)) {
++                memcpy(logPath, hostPath, prefix);
++                strcpy(logPath + prefix, "lc32-open-log.txt");
++                logPathReady.store(true);
++            }
++        }
++    }
++    if(!logPathReady.load()) return;
++
++    bool audio = false;
++    const char *dot = strrchr(guestPath, '.');
++    if(dot) {
++        static const char *const extensions[] = {
++            ".ogg", ".mp3", ".m4a", ".caf", ".wav", ".aac", ".aif", ".aiff",
++            ".mid", ".midi", ".mp4", ".xm", ".mod", ".it", ".s3m", ".flac",
++        };
++        for(const char *extension : extensions) {
++            if(strcasecmp(dot, extension) == 0) { audio = true; break; }
++        }
++    }
++    if(failed) {
++        if(failedCount.fetch_add(1) >= 300) return;
++    } else if(audio) {
++        if(audioCount.fetch_add(1) >= 100) return;
++    } else {
++        return;
++    }
++    FILE *file = fopen(logPath, "a");
++    if(!file) return;
++    fprintf(file, "%s %s value=%d\n", failed ? "FAIL" : "OPEN", guestPath,
++        value);
++    fclose(file);
++}
++
+ int guest_open(int NR, u32 guest_path, int oflag, int mode) {
+     char copied_path[PATH_MAX];
+     char host_path[PATH_MAX];
+@@ -4106,6 +4157,8 @@
+             !threadHandle.cpsr->hasCarry()) {
+         RegisterGuestAesFileDescriptor(result);
+     }
++    LC32LogGuestOpen(copied_path, host_path,
++        threadHandle.cpsr->hasCarry(), result);
+     return result;
+ }
+ 
