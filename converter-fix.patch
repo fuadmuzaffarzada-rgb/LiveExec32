@@ -1,0 +1,45 @@
+--- /tmp/host_before_diag.mm	2026-10-24 07:00:23.492024715 +0000
++++ AudioToolbox.fixed.mm	2026-10-24 07:30:43.771049388 +0000
+@@ -462,7 +462,7 @@
+ };
+ 
+ OSStatus AudioConverterInputCallbackBridge(
+-        AudioConverterRef, UInt32 *ioNumberDataPackets,
++        AudioConverterRef nativeConverter, UInt32 *ioNumberDataPackets,
+         AudioBufferList *ioData,
+         AudioStreamPacketDescription **outDataPacketDescription,
+         void *rawContext) noexcept {
+@@ -558,7 +558,32 @@
+         }
+         if(outDataPacketDescription && returnedPackets &&
+            !guestPacketDescriptions) {
+-            return kAudio_ParamError;
++            /* The host converter asks for packet descriptions, but the guest
++             * callback did not supply any. Old games only fill them in for
++             * variable-size packet formats, so for a constant-size format
++             * (mBytesPerPacket != 0) build the descriptions here instead of
++             * failing the whole conversion with paramErr (-50). */
++            AudioStreamBasicDescription inputFormat = {};
++            UInt32 inputFormatSize = sizeof(inputFormat);
++            if(!nativeConverter ||
++               AudioConverterGetProperty(nativeConverter,
++                    kAudioConverterCurrentInputStreamDescription,
++                    &inputFormatSize, &inputFormat) != noErr ||
++               inputFormat.mBytesPerPacket == 0 ||
++               returnedPackets > kMaximumAudioBytes /
++                    sizeof(AudioStreamPacketDescription)) {
++                return kAudio_ParamError;
++            }
++            context->packetDescriptions->resize(returnedPackets);
++            for(u32 index = 0; index < returnedPackets; ++index) {
++                AudioStreamPacketDescription &description =
++                    (*context->packetDescriptions)[index];
++                description.mStartOffset = static_cast<SInt64>(index) *
++                    inputFormat.mBytesPerPacket;
++                description.mVariableFramesInPacket = 0;
++                description.mDataByteSize = inputFormat.mBytesPerPacket;
++            }
++            *outDataPacketDescription = context->packetDescriptions->data();
+         }
+         if(guestPacketDescriptions && returnedPackets) {
+             if(returnedPackets >
