@@ -71,6 +71,18 @@ static void LC32AudioLogLine(const char *format, ...) {
 
 static void LC32AudioLog(uint32_t opcode, uint32_t status,
                          const uint64_t *slots, uint32_t slotCount) {
+    /* Record the first call of every AudioToolbox operation, even successful
+     * ones, so the log shows which APIs a game uses for its music. */
+    static uint64_t seenOps[4];
+    if(opcode < 256) {
+        const uint64_t bit = (uint64_t)1 << (opcode & 63);
+        uint64_t *word = &seenOps[opcode >> 6];
+        if(!(__atomic_load_n(word, __ATOMIC_RELAXED) & bit)) {
+            __atomic_fetch_or(word, bit, __ATOMIC_RELAXED);
+            LC32AudioLogLine("FIRST USE op=%u status=%d arg0=0x%x", opcode,
+                (int)status, slotCount > 0 ? (unsigned)slots[0] : 0);
+        }
+    }
     const int setup = opcode == LC32AudioToolboxOpAudioSessionGetProperty ||
         opcode == LC32AudioToolboxOpAudioSessionSetActive ||
         opcode == LC32AudioToolboxOpAudioSessionSetProperty ||
